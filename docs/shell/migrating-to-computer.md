@@ -61,11 +61,11 @@ Construct both workspaces on the same storage, walk the Shell table, and write e
 import { Workspace as ShellWorkspace } from "@cloudflare/shell";
 import { Workspace } from "@cloudflare/computer";
 
-// Shell resolves a relative target against the link's directory and never
-// goes above `/`.
+// Shell resolves a target against the link's directory and never goes above
+// `/`. An absolute target is normalised the same way, so `/../notes.md`
+// resolves to `/notes.md` before it moves under `root`.
 function resolveTarget(link: string, target: string): string {
-  if (target.startsWith("/")) return target;
-  const parts = link.split("/").slice(1, -1);
+  const parts = target.startsWith("/") ? [] : link.split("/").slice(1, -1);
   for (const part of target.split("/")) {
     if (part === "..") parts.pop();
     else if (part !== "" && part !== ".") parts.push(part);
@@ -88,7 +88,12 @@ async function copyShellWorkspace(
     } else if (entry.type === "symlink" && entry.target) {
       // Resolve the target the way Shell does, then move it with the files.
       const target = resolveTarget(entry.path, entry.target);
-      await to.fs.symlink(at(target), at(entry.path));
+      const link = at(entry.path);
+      // `symlink` throws EEXIST, so a second run has to clear the old link.
+      if (await to.fs.readlink(link).then(() => true, () => false)) {
+        await to.fs.rm(link);
+      }
+      await to.fs.symlink(at(target), link);
     } else {
       const bytes = await from.readFileBytes(entry.path);
       if (bytes !== null) await to.fs.writeFile(at(entry.path), bytes);
