@@ -1,4 +1,4 @@
-import type { ProviderV4 } from "@ai-sdk/provider";
+import { APICallError, type ProviderV4 } from "@ai-sdk/provider";
 import { createProviderRegistry, generateText } from "ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -377,5 +377,109 @@ describe("model ids", () => {
     const binding = fakeBinding(() => jsonResponse(plainBody));
     const ai = createAI({ binding: asAi(binding) });
     expect(ai(MODEL).supportedUrls).toEqual({});
+  });
+});
+
+describe("failures that escape a streamed body", () => {
+  const encoder = new TextEncoder();
+
+  /** One SSE event, as `/run` sends it. */
+  const event = (data: unknown) => `data: ${JSON.stringify(data)}\n\n`;
+
+  const CHUNK = event({
+    choices: [{ delta: { content: "hi" }, index: 0 }]
+  });
+
+  /** A body that hands out one event, then drops as a lost connection does. */
+  function droppingBody(): ReadableStream<Uint8Array> {
+    let sent = false;
+    return new ReadableStream({
+      pull(controller) {
+        if (sent) {
+          controller.error(new TypeError("Network connection lost."));
+          return;
+        }
+        sent = true;
+        controller.enqueue(encoder.encode(CHUNK));
+      }
+    });
+  }
+
+  /**
+   * A binding whose run-path stream names its run and then drops, and whose
+   * resume route answers `404` — the run is no longer held, so the provider
+   * gives up from inside the stream rather than from `run()`.
+   */
+  function resumeGoneBinding() {
+    return {
+      aiGatewayLogId: "01LOGID",
+      async fetch() {
+        return new Response("gone", { status: 404 });
+      },
+      async run() {
+        return new Response(droppingBody(), {
+          headers: {
+            "cf-aig-run-id": "run-123",
+            "content-type": "text/event-stream"
+          }
+        });
+      }
+    } as unknown as Ai;
+  }
+
+  async function failureFromStream(model: ProviderV4) {
+    const { stream } = await (
+      model as unknown as {
+        doStream: (
+          options: ReturnType<typeof callOptions>
+        ) => Promise<{ stream: ReadableStream<unknown> }>;
+      }
+    ).doStream(callOptions());
+    try {
+      await collect(stream);
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  }
+
+  it("raises a failed resume as the AI SDK error type", async () => {
+    const ai = createAI({ binding: resumeGoneBinding() });
+    const error = await failureFromStream(
+      ai("anthropic/claude-haiku-4.5") as unknown as ProviderV4
+    );
+
+    // The public type, so `catch (e) { if (e instanceof CloudflareAIError) }`
+    // — the pattern the docs show — reaches a failed resume too.
+    expect(error).toBeInstanceOf(CloudflareAIError);
+    expect((error as CloudflareAIError).code).toBe("provider-error");
+    expect((error as CloudflareAIError).status).toBe(404);
+  });
+
+  it("makes a failed resume readable by the AI SDK retry loop", async () => {
+    const ai = createAI({ binding: resumeGoneBinding() });
+    const error = await failureFromStream(
+      ai("anthropic/claude-haiku-4.5") as unknown as ProviderV4
+    );
+
+    // `CloudflareAIError` extends `APICallError`, which is what `ai` checks
+    // before it reads `isRetryable`.
+    expect(APICallError.isInstance(error)).toBe(true);
+  });
+
+  it("still answers logIdFallback after the body is re-wrapped", async () => {
+    const binding = fakeBinding(() => jsonResponse(plainBody));
+    (binding as unknown as { aiGatewayLogId: string }).aiGatewayLogId =
+      "01LOGID";
+    const ai = createAI({ binding: asAi(binding) });
+    const { providerMetadata } = await generateText({
+      model: ai(MODEL),
+      prompt: "hi"
+    });
+
+    const cloudflare = providerMetadata?.cloudflare as
+      | Record<string, unknown>
+      | undefined;
+    expect(cloudflare?.logId).toBe("01LOGID");
   });
 });
